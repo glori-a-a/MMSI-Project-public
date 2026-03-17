@@ -1,6 +1,8 @@
+import copy
+import math
+
 import torch
 import torch.nn as nn
-import math
 
 
 class Permute(nn.Module):
@@ -43,8 +45,78 @@ class FiLMLayer(nn.Module):
         return conditioned * (1.0 + gamma) + beta
 
 
+class BottleneckFusionLayer(nn.Module):
+    def __init__(self, d_model=512, nhead=8, dim_feedforward=1024):
+        super().__init__()
+        self.lang_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+        )
+        self.visual_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+        )
+
+    def forward(self, lang_tokens, visual_tokens, bottleneck_tokens):
+        bottleneck_count = bottleneck_tokens.size(0)
+
+        lang_out = self.lang_layer(torch.cat([lang_tokens, bottleneck_tokens], dim=0))
+        visual_out = self.visual_layer(torch.cat([visual_tokens, bottleneck_tokens], dim=0))
+
+        shared_bottlenecks = 0.5 * (lang_out[-bottleneck_count:] + visual_out[-bottleneck_count:])
+        return lang_out[:-bottleneck_count], visual_out[:-bottleneck_count], shared_bottlenecks
+
+
+class BottleneckFusionStack(nn.Module):
+    def __init__(self, d_model=512, nhead=8, dim_feedforward=1024, num_layers=2,
+                 num_bottleneck_layers=1, num_bottleneck_tokens=4):
+        super().__init__()
+        num_bottleneck_layers = max(1, min(num_layers, num_bottleneck_layers))
+        num_prefusion_layers = num_layers - num_bottleneck_layers
+
+        base_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+        )
+        self.lang_prefusion_layers = nn.ModuleList(
+            [copy.deepcopy(base_layer) for _ in range(num_prefusion_layers)]
+        )
+        self.visual_prefusion_layers = nn.ModuleList(
+            [copy.deepcopy(base_layer) for _ in range(num_prefusion_layers)]
+        )
+        self.bottleneck_layers = nn.ModuleList(
+            [
+                BottleneckFusionLayer(
+                    d_model=d_model,
+                    nhead=nhead,
+                    dim_feedforward=dim_feedforward,
+                )
+                for _ in range(num_bottleneck_layers)
+            ]
+        )
+        self.bottleneck_tokens = nn.Parameter(torch.randn(num_bottleneck_tokens, 1, d_model))
+
+    def forward(self, lang_tokens, visual_tokens):
+        batch_size = lang_tokens.size(1)
+        for layer in self.lang_prefusion_layers:
+            lang_tokens = layer(lang_tokens)
+        for layer in self.visual_prefusion_layers:
+            visual_tokens = layer(visual_tokens)
+
+        bottlenecks = self.bottleneck_tokens.repeat(1, batch_size, 1)
+        for layer in self.bottleneck_layers:
+            lang_tokens, visual_tokens, bottlenecks = layer(lang_tokens, visual_tokens, bottlenecks)
+
+        return torch.cat([lang_tokens, visual_tokens], dim=0)
+
+
 class MultimodalBaseline(nn.Module):
-    def __init__(self, class_num, language_model, visual_film_layers=0, fusion_film_layers=0, projection_dim=128):
+    def __init__(self, class_num, language_model, visual_film_layers=0, fusion_film_layers=0,
+                 projection_dim=128, fusion_mode='standard', bottleneck_tokens=4,
+                 bottleneck_fusion_layers=1):
         super(MultimodalBaseline, self).__init__()
 
         self.class_num = class_num
@@ -52,6 +124,9 @@ class MultimodalBaseline(nn.Module):
         self.visual_film_layers = visual_film_layers
         self.fusion_film_layers = fusion_film_layers
         self.projection_dim = projection_dim
+        self.fusion_mode = fusion_mode
+        self.bottleneck_tokens = bottleneck_tokens
+        self.bottleneck_fusion_layers = bottleneck_fusion_layers
 
         if language_model == 'bert':
             from transformers import BertModel
@@ -118,6 +193,14 @@ class MultimodalBaseline(nn.Module):
         multi_trans_layer = nn.TransformerEncoderLayer(d_model=512, nhead=8, dim_feedforward=1024)
         self.multi_trans = nn.TransformerEncoder(multi_trans_layer, num_layers=2)
         self.multi_trans_pre = nn.TransformerEncoder(multi_trans_layer, num_layers=2)
+        self.multi_trans_bottleneck = BottleneckFusionStack(
+            d_model=512,
+            nhead=8,
+            dim_feedforward=1024,
+            num_layers=2,
+            num_bottleneck_layers=bottleneck_fusion_layers,
+            num_bottleneck_tokens=bottleneck_tokens,
+        )
 
         self.visual_film = nn.ModuleList(
             [FiLMLayer(feature_dim=512, condition_dim=512) for _ in range(visual_film_layers)]
@@ -183,8 +266,12 @@ class MultimodalBaseline(nn.Module):
             fused_feature = torch.concat([cls_tokens, vis_feature], 0)
             fused_feature = self.multi_trans_pre(fused_feature)
         else:
-            fused_feature = torch.concat([cls_tokens, convers_feature_token, vis_feature], 0)
-            fused_feature = self.multi_trans(fused_feature)
+            lang_tokens = torch.concat([cls_tokens, convers_feature_token], 0)
+            if self.fusion_mode == 'bottleneck':
+                fused_feature = self.multi_trans_bottleneck(lang_tokens, vis_feature)
+            else:
+                fused_feature = torch.concat([lang_tokens, vis_feature], 0)
+                fused_feature = self.multi_trans(fused_feature)
             for film_layer in self.fusion_film:
                 fused_feature = film_layer(fused_feature, convers_feature)
 

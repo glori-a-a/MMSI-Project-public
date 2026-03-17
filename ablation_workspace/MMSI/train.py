@@ -96,6 +96,12 @@ def parse_args():
     parser.add_argument('--workers', type=int, default=0, help='Number of data loading workers')
     parser.add_argument('--visual_film_layers', type=int, default=0, help='Number of FiLM layers in visual interaction encoder')
     parser.add_argument('--fusion_film_layers', type=int, default=0, help='Number of FiLM layers in aligned multimodal fusion module')
+    parser.add_argument('--fusion_mode', type=str, default='standard', choices=['standard', 'bottleneck'],
+                        help='Fusion module type for aligned multimodal fusion')
+    parser.add_argument('--bottleneck_tokens', type=int, default=4,
+                        help='Number of shared bottleneck tokens when fusion_mode=bottleneck')
+    parser.add_argument('--bottleneck_fusion_layers', type=int, default=1,
+                        help='Number of fusion layers using attention bottlenecks')
     parser.add_argument('--center_loss_weight', type=float, default=0.0, help='Weight for center loss, use 0.0 to disable')
     parser.add_argument('--center_loss_lr', type=float, default=0.5, help='Learning rate for center loss centers')
     parser.add_argument('--supcon_weight', type=float, default=0.0, help='Weight for supervised contrastive loss, use 0.0 to disable')
@@ -190,6 +196,10 @@ def main():
         raise ValueError("--center_loss_weight must be in [0, 1].")
     if args.supcon_weight < 0.0:
         raise ValueError("--supcon_weight must be >= 0.")
+    if args.bottleneck_tokens < 1:
+        raise ValueError("--bottleneck_tokens must be >= 1.")
+    if args.bottleneck_fusion_layers < 1:
+        raise ValueError("--bottleneck_fusion_layers must be >= 1.")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     os.makedirs(args.checkpoint_save_dir, exist_ok=True)
@@ -200,6 +210,9 @@ def main():
         visual_film_layers=args.visual_film_layers,
         fusion_film_layers=args.fusion_film_layers,
         projection_dim=args.projection_dim,
+        fusion_mode=args.fusion_mode,
+        bottleneck_tokens=args.bottleneck_tokens,
+        bottleneck_fusion_layers=args.bottleneck_fusion_layers,
     ).to(device)
     wandb_run = None
     if args.use_wandb:
@@ -283,6 +296,9 @@ def main():
                 'best_epoch': best_epoch + 1,
                 'visual_film_layers': args.visual_film_layers,
                 'fusion_film_layers': args.fusion_film_layers,
+                'fusion_mode': args.fusion_mode,
+                'bottleneck_tokens': args.bottleneck_tokens,
+                'bottleneck_fusion_layers': args.bottleneck_fusion_layers,
                 'center_loss_weight': args.center_loss_weight,
                 'supcon_weight': args.supcon_weight,
             })
