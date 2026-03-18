@@ -104,6 +104,8 @@ def parse_args():
                         help='Number of fusion layers using attention bottlenecks')
     parser.add_argument('--graph_layers', type=int, default=0,
                         help='Number of graph interaction layers over player nodes')
+    parser.add_argument('--graph_mode', type=str, default='standard', choices=['standard', 'speaker_centered'],
+                        help='Graph interaction mode for player relation modeling')
     parser.add_argument('--center_loss_weight', type=float, default=0.0, help='Weight for center loss, use 0.0 to disable')
     parser.add_argument('--center_loss_lr', type=float, default=0.5, help='Learning rate for center loss centers')
     parser.add_argument('--supcon_weight', type=float, default=0.0, help='Weight for supervised contrastive loss, use 0.0 to disable')
@@ -218,6 +220,7 @@ def main():
         bottleneck_tokens=args.bottleneck_tokens,
         bottleneck_fusion_layers=args.bottleneck_fusion_layers,
         graph_layers=args.graph_layers,
+        graph_mode=args.graph_mode,
     ).to(device)
     wandb_run = None
     if args.use_wandb:
@@ -305,6 +308,7 @@ def main():
                 'bottleneck_tokens': args.bottleneck_tokens,
                 'bottleneck_fusion_layers': args.bottleneck_fusion_layers,
                 'graph_layers': args.graph_layers,
+                'graph_mode': args.graph_mode,
                 'center_loss_weight': args.center_loss_weight,
                 'supcon_weight': args.supcon_weight,
             })

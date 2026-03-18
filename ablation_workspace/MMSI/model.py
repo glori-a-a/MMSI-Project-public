@@ -114,7 +114,7 @@ class BottleneckFusionStack(nn.Module):
 
 
 class GraphInteractionLayer(nn.Module):
-    def __init__(self, d_model=512):
+    def __init__(self, d_model=512, speaker_centered=False, condition_dim=512):
         super().__init__()
         self.query_proj = nn.Linear(d_model, d_model)
         self.key_proj = nn.Linear(d_model, d_model)
@@ -126,6 +126,9 @@ class GraphInteractionLayer(nn.Module):
         )
         self.out_proj = nn.Linear(d_model, d_model)
         self.norm1 = nn.LayerNorm(d_model)
+        self.condition_norm = nn.LayerNorm(d_model)
+        self.cond_gamma = nn.Linear(condition_dim, d_model)
+        self.cond_beta = nn.Linear(condition_dim, d_model)
         self.ffn = nn.Sequential(
             nn.Linear(d_model, d_model * 2),
             nn.ReLU(),
@@ -133,10 +136,19 @@ class GraphInteractionLayer(nn.Module):
         )
         self.norm2 = nn.LayerNorm(d_model)
         self.scale = math.sqrt(d_model)
+        self.speaker_centered = speaker_centered
+        if speaker_centered:
+            self.speaker_bias = nn.Embedding(3, 1)
 
-    def forward(self, node_features, player_centers, player_mask):
+    def forward(self, node_features, player_centers, player_mask, speaker_labels, condition=None):
         # node_features: [batch, players, dim], player_centers: [batch, players, 2]
         # player_mask: [batch, players], 1 for valid players, 0 otherwise
+        if condition is not None:
+            conditioned = self.condition_norm(node_features)
+            gamma = self.cond_gamma(condition).unsqueeze(1)
+            beta = self.cond_beta(condition).unsqueeze(1)
+            node_features = conditioned * (1.0 + gamma) + beta
+
         q = self.query_proj(node_features)
         k = self.key_proj(node_features)
         v = self.value_proj(node_features)
@@ -145,6 +157,15 @@ class GraphInteractionLayer(nn.Module):
         relative_pos = player_centers.unsqueeze(2) - player_centers.unsqueeze(1)
         rel_bias = torch.tanh(self.rel_proj(relative_pos)).squeeze(-1) * 2.0
         attn_logits = attn_logits + rel_bias
+
+        if self.speaker_centered:
+            player_ids = torch.arange(node_features.size(1), device=node_features.device).view(1, -1)
+            source_is_speaker = player_ids.unsqueeze(2) == speaker_labels.view(-1, 1, 1)
+            target_is_speaker = player_ids.unsqueeze(1) == speaker_labels.view(-1, 1, 1)
+            edge_type = torch.zeros_like(attn_logits, dtype=torch.long)
+            edge_type = torch.where(source_is_speaker, torch.ones_like(edge_type), edge_type)
+            edge_type = torch.where(target_is_speaker, torch.full_like(edge_type, 2), edge_type)
+            attn_logits = attn_logits + self.speaker_bias(edge_type).squeeze(-1)
 
         self_mask = torch.eye(node_features.size(1), device=node_features.device).unsqueeze(0)
         valid_targets = player_mask.unsqueeze(1).bool()
@@ -166,7 +187,7 @@ class GraphInteractionLayer(nn.Module):
 class MultimodalBaseline(nn.Module):
     def __init__(self, class_num, language_model, visual_film_layers=0, fusion_film_layers=0,
                  projection_dim=128, fusion_mode='standard', bottleneck_tokens=4,
-                 bottleneck_fusion_layers=1, graph_layers=0):
+                 bottleneck_fusion_layers=1, graph_layers=0, graph_mode='standard'):
         super(MultimodalBaseline, self).__init__()
 
         self.class_num = class_num
@@ -178,6 +199,7 @@ class MultimodalBaseline(nn.Module):
         self.bottleneck_tokens = bottleneck_tokens
         self.bottleneck_fusion_layers = bottleneck_fusion_layers
         self.graph_layers = graph_layers
+        self.graph_mode = graph_mode
 
         if language_model == 'bert':
             from transformers import BertModel
@@ -245,7 +267,14 @@ class MultimodalBaseline(nn.Module):
         self.graph_role_embedding = nn.Embedding(2, 512)
         self.graph_input_norm = nn.LayerNorm(512)
         self.graph_layers_stack = nn.ModuleList(
-            [GraphInteractionLayer(d_model=512) for _ in range(graph_layers)]
+            [
+                GraphInteractionLayer(
+                    d_model=512,
+                    speaker_centered=(graph_mode == 'speaker_centered'),
+                    condition_dim=512,
+                )
+                for _ in range(graph_layers)
+            ]
         )
 
         visual_trans_layer = nn.TransformerEncoderLayer(d_model=512, nhead=8, dim_feedforward=1024)
@@ -330,7 +359,13 @@ class MultimodalBaseline(nn.Module):
             player_nodes = player_nodes * player_mask.unsqueeze(-1)
 
             for graph_layer in self.graph_layers_stack:
-                player_nodes = graph_layer(player_nodes, player_centers, player_mask)
+                player_nodes = graph_layer(
+                    player_nodes,
+                    player_centers,
+                    player_mask,
+                    speaker_labels,
+                    condition=convers_feature,
+                )
 
             graph_tokens = [player_nodes.permute(1, 0, 2)]
 
