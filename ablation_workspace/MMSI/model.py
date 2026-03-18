@@ -134,23 +134,32 @@ class GraphInteractionLayer(nn.Module):
         self.norm2 = nn.LayerNorm(d_model)
         self.scale = math.sqrt(d_model)
 
-    def forward(self, node_features, player_centers):
+    def forward(self, node_features, player_centers, player_mask):
         # node_features: [batch, players, dim], player_centers: [batch, players, 2]
+        # player_mask: [batch, players], 1 for valid players, 0 otherwise
         q = self.query_proj(node_features)
         k = self.key_proj(node_features)
         v = self.value_proj(node_features)
 
         attn_logits = torch.matmul(q, k.transpose(-1, -2)) / self.scale
         relative_pos = player_centers.unsqueeze(2) - player_centers.unsqueeze(1)
-        attn_logits = attn_logits + self.rel_proj(relative_pos).squeeze(-1)
+        rel_bias = torch.tanh(self.rel_proj(relative_pos)).squeeze(-1) * 2.0
+        attn_logits = attn_logits + rel_bias
 
         self_mask = torch.eye(node_features.size(1), device=node_features.device).unsqueeze(0)
-        attn_logits = attn_logits.masked_fill(self_mask.bool(), float('-inf'))
+        valid_targets = player_mask.unsqueeze(1).bool()
+        attn_logits = attn_logits.masked_fill(self_mask.bool(), -1e4)
+        attn_logits = attn_logits.masked_fill(~valid_targets, -1e4)
+        attn_logits = attn_logits - attn_logits.amax(dim=-1, keepdim=True)
         attn_weights = torch.softmax(attn_logits, dim=-1)
+        attn_weights = torch.nan_to_num(attn_weights, nan=0.0, posinf=0.0, neginf=0.0)
+        attn_weights = attn_weights * valid_targets.float()
 
         aggregated = torch.matmul(attn_weights, v)
+        aggregated = aggregated * player_mask.unsqueeze(-1)
         node_features = self.norm1(node_features + self.out_proj(aggregated))
         node_features = self.norm2(node_features + self.ffn(node_features))
+        node_features = node_features * player_mask.unsqueeze(-1)
         return node_features
 
 
@@ -234,6 +243,7 @@ class MultimodalBaseline(nn.Module):
             nn.Linear(256, 512),
         )
         self.graph_role_embedding = nn.Embedding(2, 512)
+        self.graph_input_norm = nn.LayerNorm(512)
         self.graph_layers_stack = nn.ModuleList(
             [GraphInteractionLayer(d_model=512) for _ in range(graph_layers)]
         )
@@ -310,14 +320,17 @@ class MultimodalBaseline(nn.Module):
             valid_count = valid_mask.sum(dim=2).clamp(min=1.0)
             avg_pose = (keypoint_players * valid_mask).sum(dim=2) / valid_count
             player_centers = avg_pose[:, :, 5, :]
+            player_mask = (valid_mask.sum(dim=(2, 3, 4)) > 0).float()
             player_nodes = self.graph_node_encoder(avg_pose.reshape(batch_size, self.class_num, -1))
 
             player_ids = torch.arange(self.class_num, device=keypoint_seqs.device).unsqueeze(0)
             speaker_roles = (player_ids == speaker_labels.unsqueeze(1)).long()
             player_nodes = player_nodes + self.graph_role_embedding(speaker_roles)
+            player_nodes = self.graph_input_norm(player_nodes)
+            player_nodes = player_nodes * player_mask.unsqueeze(-1)
 
             for graph_layer in self.graph_layers_stack:
-                player_nodes = graph_layer(player_nodes, player_centers)
+                player_nodes = graph_layer(player_nodes, player_centers, player_mask)
 
             graph_tokens = [player_nodes.permute(1, 0, 2)]
 
