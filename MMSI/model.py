@@ -177,8 +177,11 @@ class MultimodalBaseline(nn.Module):
         if visual_frames.dim() == 3:
             frame_features = self.visual_fc(visual_frames)
             if self.uses_keypoints:
-                global_token = frame_features.mean(dim=1, keepdim=True)
-                frame_features = torch.cat([global_token, frame_features[:, ::2, :]], dim=1)
+                if self.visual_feature_type in ['marlin', 'keypoint_marlin'] and frame_features.size(1) == 1:
+                    frame_features = frame_features.repeat(1, 9, 1)
+                else:
+                    global_token = frame_features.mean(dim=1, keepdim=True)
+                    frame_features = torch.cat([global_token, frame_features[:, ::2, :]], dim=1)
             return frame_features.permute(1, 0, 2)
 
         if self.visual_feature_type in ['marlin', 'keypoint_marlin']:
