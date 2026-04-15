@@ -40,6 +40,8 @@ def parse_args():
     parser.add_argument('--marlin_from_online', action='store_true', help='Download MARLIN weights from upstream at runtime')
     parser.add_argument('--precomputed_visual_features', action='store_true',
                         help='Treat --video_dir as cached 768-d visual features instead of raw frames')
+    parser.add_argument('--fusion_strategy', type=str, default='gated', choices=['gated', 'late_concat'],
+                        help='Strategy for combining keypoints with video features')
     parser.add_argument('--max_people_num', type=int, default=6, help='Maximum number of total players')
     parser.add_argument('--context_length', type=int, default=5, help='Size of conversation context')
     parser.add_argument('--batch_size', type=int, default=16, help='Mini-batch size')
@@ -97,6 +99,7 @@ def main():
         marlin_checkpoint=args.marlin_checkpoint,
         marlin_from_online=args.marlin_from_online,
         precomputed_visual_features=args.precomputed_visual_features,
+        fusion_strategy=args.fusion_strategy,
     ).to(device)
 
     checkpoint = torch.load(args.checkpoint_file, map_location=device)

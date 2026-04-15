@@ -37,7 +37,7 @@ class PositionalEncoding(nn.Module):
 class MultimodalBaseline(nn.Module):
     def __init__(self, class_num, language_model, tokenizer, text_pooling='auto', visual_feature_type='keypoint',
                  marlin_model_name='marlin_vit_base_ytf', marlin_checkpoint=None, marlin_from_online=False,
-                 precomputed_visual_features=False):
+                 precomputed_visual_features=False, fusion_strategy='gated'):
         super(MultimodalBaseline, self).__init__()
 
         self.class_num = class_num
@@ -48,6 +48,7 @@ class MultimodalBaseline(nn.Module):
         self.use_visual_only = visual_feature_type in ['vit', 'marlin']
         self.marlin_model_name = marlin_model_name
         self.precomputed_visual_features = precomputed_visual_features
+        self.fusion_strategy = fusion_strategy
         self.visual_fusion_logit = nn.Parameter(torch.tensor(-2.0))
 
         self.text_encoder = TextEncoderFactory(language_model, tokenizer, pooling=text_pooling)
@@ -132,8 +133,9 @@ class MultimodalBaseline(nn.Module):
                     marlin_hidden_size = self.marlin_encoder.encoder.embed_dim
                     self.visual_fc = nn.Linear(marlin_hidden_size, 512)
 
+        classifier_dim = 1024 if fusion_strategy == 'late_concat' else 512
         self.classifier = nn.Sequential(
-            nn.Linear(512, class_num))
+            nn.Linear(classifier_dim, class_num))
 
         imagenet_mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 1, 3, 1, 1)
         imagenet_std = torch.tensor([0.229, 0.224, 0.225]).view(1, 1, 3, 1, 1)
@@ -235,14 +237,23 @@ class MultimodalBaseline(nn.Module):
         if not visual_streams:
             raise ValueError("At least one visual stream must be enabled")
 
+        batch_size = speaker_labels.size(0)
+        cls_tokens = self.cls_token.repeat(1, batch_size, 1)
+
         if len(visual_streams) == 1:
             vis_feature = visual_streams[0]
+        elif self.fusion_strategy == 'late_concat':
+            keypoint_feature, frame_feature = visual_streams
+            if warmup:
+                keypoint_fused = self.multi_trans_pre(torch.concat([cls_tokens, keypoint_feature], 0))
+                frame_fused = self.multi_trans_pre(torch.concat([cls_tokens, frame_feature], 0))
+            else:
+                keypoint_fused = self.multi_trans(torch.concat([cls_tokens, convers_feature, keypoint_feature], 0))
+                frame_fused = self.multi_trans(torch.concat([cls_tokens, convers_feature, frame_feature], 0))
+            return self.classifier(torch.concat([keypoint_fused[0, :, :], frame_fused[0, :, :]], dim=-1))
         else:
             visual_weight = torch.sigmoid(self.visual_fusion_logit)
             vis_feature = (1.0 - visual_weight) * visual_streams[0] + visual_weight * visual_streams[1]
-
-        batch_size = speaker_labels.size(0)
-        cls_tokens = self.cls_token.repeat(1, batch_size, 1)
 
         if warmup:
             fused_feature = torch.concat([cls_tokens, vis_feature], 0)
