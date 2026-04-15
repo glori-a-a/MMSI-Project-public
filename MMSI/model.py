@@ -48,6 +48,7 @@ class MultimodalBaseline(nn.Module):
         self.use_visual_only = visual_feature_type in ['vit', 'marlin']
         self.marlin_model_name = marlin_model_name
         self.precomputed_visual_features = precomputed_visual_features
+        self.visual_fusion_logit = nn.Parameter(torch.tensor(-2.0))
 
         self.text_encoder = TextEncoderFactory(language_model, tokenizer, pooling=text_pooling)
         self.convers_encoder = self.text_encoder.encoder
@@ -234,7 +235,8 @@ class MultimodalBaseline(nn.Module):
         if len(visual_streams) == 1:
             vis_feature = visual_streams[0]
         else:
-            vis_feature = torch.stack(visual_streams, dim=0).mean(dim=0)
+            visual_weight = torch.sigmoid(self.visual_fusion_logit)
+            vis_feature = (1.0 - visual_weight) * visual_streams[0] + visual_weight * visual_streams[1]
 
         batch_size = speaker_labels.size(0)
         cls_tokens = self.cls_token.repeat(1, batch_size, 1)
