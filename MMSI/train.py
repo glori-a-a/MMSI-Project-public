@@ -1,15 +1,16 @@
 import argparse
+import os
 import random
 from functools import partial
-import os
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
 from torch.cuda.amp import GradScaler
+from torch.utils.data import DataLoader
 
 from dataloader import SocialDataset, collate_fn
 from model import MultimodalBaseline
+from text_encoder import get_tokenizer
 from utils import AverageMeter, Progbar
 
 
@@ -31,7 +32,17 @@ def parse_args():
     parser.add_argument('--meta_dir', type=str, default='enter_the_path', help='Directory of game meta data')
     parser.add_argument('--data_split_file', type=str, default='enter_the_path', help='File path for data split')
     parser.add_argument('--checkpoint_save_dir', type=str, default='./checkpoints', help='Directory for saving checkpoints')
-    parser.add_argument('--language_model', type=str, default='bert', choices=['bert', 'roberta', 'electra'], help='Language model to use')
+    parser.add_argument('--video_dir', type=str, default=None, help='Directory containing extracted frames, videos, or cached arrays')
+    parser.add_argument('--language_model', type=str, default='gpt2', choices=['bert', 'roberta', 'electra', 'gpt2', 'bart'], help='Language model to use')
+    parser.add_argument('--text_pooling', type=str, default='auto', choices=['auto', 'mask', 'last', 'mean'], help='Text pooling strategy')
+    parser.add_argument('--visual_feature_type', type=str, default='keypoint',
+                        choices=['keypoint', 'vit', 'keypoint_vit', 'marlin', 'keypoint_marlin'],
+                        help='Visual representation to use')
+    parser.add_argument('--marlin_model_name', type=str, default='marlin_vit_base_ytf', help='MARLIN backbone variant')
+    parser.add_argument('--marlin_checkpoint', type=str, default=None, help='Local MARLIN encoder/full checkpoint path')
+    parser.add_argument('--marlin_from_online', action='store_true', help='Download MARLIN weights from upstream at runtime')
+    parser.add_argument('--precomputed_visual_features', action='store_true',
+                        help='Treat --video_dir as cached 768-d visual features instead of raw frames')
     parser.add_argument('--max_people_num', type=int, default=6, help='Maximum number of total players')
     parser.add_argument('--context_length', type=int, default=5, help='Size of conversation context')
     parser.add_argument('--batch_size', type=int, default=16, help='Mini-batch size')
@@ -39,37 +50,42 @@ def parse_args():
     parser.add_argument('--epochs', type=int, default=200, help='Number of total epochs')
     parser.add_argument('--epochs_warmup', type=int, default=10, help='Number of visual warmup epochs')
     parser.add_argument('--workers', type=int, default=0, help='Number of data loading workers')
+    parser.add_argument('--max_train_samples', type=int, default=None, help='Optional cap on number of training samples')
+    parser.add_argument('--max_test_samples', type=int, default=None, help='Optional cap on number of test samples')
+    parser.add_argument('--sequence_length', type=int, default=16, help='Temporal sequence length for keypoints and frames')
+    parser.add_argument('--video_fps', type=int, default=5, help='Frame rate used for aligned video sampling')
+    parser.add_argument('--frame_size', type=int, default=224, help='Spatial size for extracted frames')
     parser.add_argument('--use_wandb', action='store_true', help='Enable Weights & Biases logging')
     parser.add_argument('--wandb_project', type=str, default='mmsi-baseline', help='W&B project name')
     parser.add_argument('--wandb_entity', type=str, default=None, help='W&B entity/team')
     parser.add_argument('--wandb_run_name', type=str, default=None, help='W&B run name')
     return parser.parse_args()
 
-def get_tokenizer(language_model):
-    if language_model == 'bert':
-        from transformers import BertTokenizer
-        return BertTokenizer.from_pretrained('bert-base-uncased')
-    elif language_model == 'roberta':
-        from transformers import RobertaTokenizer
-        return RobertaTokenizer.from_pretrained('roberta-base')
-    elif language_model == 'electra':
-        from transformers import ElectraTokenizer
-        return ElectraTokenizer.from_pretrained("google/electra-base-discriminator")
-    else:
-        raise ValueError(f"Unsupported language model: {language_model}")
 
 def train_one_epoch(model, dataloader, optimizer, criterion, scaler, device, epoch, args):
     model.train()
     train_loss = AverageMeter()
     progbar = Progbar(len(dataloader.dataset))
 
-    for language_tokens, mask_idxs, keypoint_seqs, speaker_labels, task_labels in dataloader:
+    for language_tokens, token_positions, keypoint_seqs, speaker_labels, task_labels, visual_frames in dataloader:
         optimizer.zero_grad()
-
-        task_labels = task_labels.to(device)
+        language_tokens = language_tokens.to(device, non_blocking=True)
+        token_positions = token_positions.to(device, non_blocking=True)
+        keypoint_seqs = keypoint_seqs.to(device, non_blocking=True)
+        speaker_labels = speaker_labels.to(device, non_blocking=True)
+        task_labels = task_labels.to(device, non_blocking=True)
+        if visual_frames is not None:
+            visual_frames = visual_frames.to(device, non_blocking=True)
 
         with torch.cuda.amp.autocast():
-            outputs = model(language_tokens, mask_idxs, keypoint_seqs, speaker_labels, warmup=(epoch < args.epochs_warmup))
+            outputs = model(
+                language_tokens,
+                token_positions,
+                keypoint_seqs,
+                speaker_labels,
+                visual_frames=visual_frames,
+                warmup=(epoch < args.epochs_warmup),
+            )
             loss = criterion(outputs, task_labels)
 
         scaler.scale(loss).backward()
@@ -81,20 +97,35 @@ def train_one_epoch(model, dataloader, optimizer, criterion, scaler, device, epo
 
     return train_loss.avg
 
+
 def evaluate(model, dataloader, device, epoch, args):
     model.eval()
     correct = 0
     total = 0
 
     with torch.no_grad():
-        for language_tokens, mask_idxs, keypoint_seqs, speaker_labels, task_labels in dataloader:
-            task_labels = task_labels.to(device)
-            outputs = model(language_tokens, mask_idxs, keypoint_seqs, speaker_labels, warmup=(epoch < args.epochs_warmup))
+        for language_tokens, token_positions, keypoint_seqs, speaker_labels, task_labels, visual_frames in dataloader:
+            language_tokens = language_tokens.to(device, non_blocking=True)
+            token_positions = token_positions.to(device, non_blocking=True)
+            keypoint_seqs = keypoint_seqs.to(device, non_blocking=True)
+            speaker_labels = speaker_labels.to(device, non_blocking=True)
+            task_labels = task_labels.to(device, non_blocking=True)
+            if visual_frames is not None:
+                visual_frames = visual_frames.to(device, non_blocking=True)
+            outputs = model(
+                language_tokens,
+                token_positions,
+                keypoint_seqs,
+                speaker_labels,
+                visual_frames=visual_frames,
+                warmup=(epoch < args.epochs_warmup),
+            )
             _, predicted = torch.max(outputs.data, 1)
             total += task_labels.size(0)
             correct += (predicted == task_labels).sum().item()
 
     return correct / total
+
 
 def main():
     args = parse_args()
@@ -102,7 +133,21 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     os.makedirs(args.checkpoint_save_dir, exist_ok=True)
 
-    model = MultimodalBaseline(args.max_people_num, args.language_model).to(device)
+    tokenizer = get_tokenizer(args.language_model)
+    args.tokenizer = tokenizer
+
+    model = MultimodalBaseline(
+        args.max_people_num,
+        args.language_model,
+        tokenizer=tokenizer,
+        text_pooling=args.text_pooling,
+        visual_feature_type=args.visual_feature_type,
+        marlin_model_name=args.marlin_model_name,
+        marlin_checkpoint=args.marlin_checkpoint,
+        marlin_from_online=args.marlin_from_online,
+        precomputed_visual_features=args.precomputed_visual_features,
+    ).to(device)
+
     wandb_run = None
     if args.use_wandb:
         try:
@@ -117,15 +162,12 @@ def main():
             config=vars(args),
         )
 
-    language_params = [p for n, p in model.named_parameters() if 'convers_encoder' in n]
-    other_params = [p for n, p in model.named_parameters() if 'convers_encoder' not in n]
+    language_params = [p for n, p in model.named_parameters() if 'text_encoder' in n or 'convers_encoder' in n]
+    other_params = [p for n, p in model.named_parameters() if 'text_encoder' not in n and 'convers_encoder' not in n]
     optimizer = torch.optim.Adam([
         {'params': other_params, 'lr': args.learning_rate * 10},
         {'params': language_params, 'lr': args.learning_rate}
     ])
-
-    tokenizer = get_tokenizer(args.language_model)
-    args.tokenizer = tokenizer
 
     collate_fn_token = partial(collate_fn, tokenizer)
     train_dataset = SocialDataset(args, is_training=True)
@@ -167,10 +209,15 @@ def main():
                 'test_acc': test_acc,
                 'best_test_acc': best_acc,
                 'best_epoch': best_epoch + 1,
+                'language_model': args.language_model,
+                'text_pooling': args.text_pooling,
+                'visual_feature_type': args.visual_feature_type,
+                'precomputed_visual_features': args.precomputed_visual_features,
             })
 
     if wandb_run is not None:
         wandb_run.finish()
+
 
 if __name__ == '__main__':
     main()

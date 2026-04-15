@@ -1,23 +1,33 @@
-import json
-import re
 import copy
+import json
+import os
+import re
 
 import numpy as np
 import torch
-from torch.utils.data import Dataset
 from torch.nn.utils.rnn import pad_sequence
+from torch.utils.data import Dataset
+
+from video_processor import build_temporal_indices, load_frame_sequence
+
 
 def collate_fn(tokenizer, batch):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    tokens, mask_idxs, keypoint_seqs, speaker_labels, task_labels = zip(*batch)
-    tokens = [torch.tensor(t) for t in tokens]
-    tokens = pad_sequence(tokens, batch_first=True, padding_value=tokenizer.pad_token_id).to(device)
-    mask_idxs = torch.tensor(mask_idxs).to(device)
-    task_labels = torch.tensor(task_labels).to(device)
-    keypoint_seqs = torch.tensor(np.array(keypoint_seqs)).to(device).float()
-    speaker_labels = torch.tensor(speaker_labels).to(device)
+    tokens, token_positions, keypoint_seqs, speaker_labels, task_labels, visual_frames = zip(*batch)
 
-    return tokens, mask_idxs, keypoint_seqs, speaker_labels, task_labels
+    tokens = [torch.tensor(t) for t in tokens]
+    tokens = pad_sequence(tokens, batch_first=True, padding_value=tokenizer.pad_token_id)
+    token_positions = torch.tensor(token_positions)
+    task_labels = torch.tensor(task_labels)
+    keypoint_seqs = torch.tensor(np.array(keypoint_seqs)).float()
+    speaker_labels = torch.tensor(speaker_labels)
+
+    if visual_frames[0] is None:
+        visual_frames = None
+    else:
+        visual_frames = torch.tensor(np.stack(visual_frames, axis=0)).float()
+
+    return tokens, token_positions, keypoint_seqs, speaker_labels, task_labels, visual_frames
+
 
 class SocialDataset(Dataset):
     def __init__(self, args, is_training=True):
@@ -25,24 +35,51 @@ class SocialDataset(Dataset):
         self.tokenizer = args.tokenizer
         self.language_model = args.language_model
         self.context_length = args.context_length
+        self.txt_dir = args.txt_dir
         self.txt_labeled_dir = args.txt_labeled_dir
         self.meta_dir = args.meta_dir
         self.keypoint_dir = args.keypoint_dir
         self.task = args.task
+        self.sequence_length = args.sequence_length
+        self.video_dir = getattr(args, 'video_dir', None)
+        self.visual_feature_type = getattr(args, 'visual_feature_type', 'keypoint')
+        self.use_video_frames = self.visual_feature_type in ['vit', 'keypoint_vit', 'marlin', 'keypoint_marlin']
+        self.video_fps = getattr(args, 'video_fps', 5)
+        self.frame_size = getattr(args, 'frame_size', 224)
+        self.alignment_records = []
 
         with open(args.data_split_file, 'r') as f:
             data_split = json.load(f)
         self.file_names = self.get_file_names(args, data_split, is_training)
         self.mask_token = self.get_mask_token(self.language_model)
+        self.start_token_id = self.get_start_token_id()
+        self.sep_token_id = self.get_separator_token_id()
         self.data_points = self.load_files(self.file_names)
+        max_samples = getattr(args, 'max_train_samples', None) if is_training else getattr(args, 'max_test_samples', None)
+        if max_samples is not None and max_samples > 0:
+            self.data_points = self.data_points[:max_samples]
 
     def get_mask_token(self, language_model):
         if language_model in ['bert', 'electra']:
             return '[MASK]'
-        elif language_model == 'roberta':
+        if language_model == 'roberta':
             return '<mask>'
-        else:
-            raise ValueError(f"Unsupported language model: {language_model}")
+        if language_model in ['gpt2', 'bart']:
+            return self.tokenizer.mask_token
+        raise ValueError(f"Unsupported language model: {language_model}")
+
+    def get_start_token_id(self):
+        for token_id in [self.tokenizer.cls_token_id, self.tokenizer.bos_token_id, self.tokenizer.eos_token_id]:
+            if token_id is not None:
+                return token_id
+        raise ValueError(f"Tokenizer for {self.language_model} does not define a valid start token")
+
+    def get_separator_token_id(self):
+        for token_id in [self.tokenizer.sep_token_id, self.tokenizer.eos_token_id]:
+            if token_id is not None:
+                return token_id
+        raise ValueError(f"Tokenizer for {self.language_model} does not define a valid separator token")
+
     def get_file_names(self, args, data_split, is_training):
         data_type = 'train' if is_training else 'test'
         return [f"{args.txt_dir}/{file_name}.txt" for file_name in data_split[data_type]]
@@ -74,7 +111,16 @@ class SocialDataset(Dataset):
             reference_timestamp = reference_timestamps[file_name]
             keypoint_seq_ref = self.get_reference_keypoints(keypoint_data[reference_timestamp], player_num)
 
-            data_points.extend(self.process_utterances(utterances, utterances_labeled, keypoint_data, keypoint_seq_ref, player_num))
+            data_points.extend(
+                self.process_utterances(
+                    file_name,
+                    utterances,
+                    utterances_labeled,
+                    keypoint_data,
+                    keypoint_seq_ref,
+                    player_num,
+                )
+            )
 
         return data_points
 
@@ -86,7 +132,7 @@ class SocialDataset(Dataset):
                 keypoint_seq_ref[keypoint_ref['idx'], :] = keypoint_wo_conf[:17 * 2]
         return keypoint_seq_ref
 
-    def process_utterances(self, utterances, utterances_labeled, keypoint_data, keypoint_seq_ref, player_num):
+    def process_utterances(self, file_name, utterances, utterances_labeled, keypoint_data, keypoint_seq_ref, player_num):
         data_points = []
 
         for utterance_i, (utterance, utterance_labeled) in enumerate(zip(utterances, utterances_labeled)):
@@ -105,11 +151,26 @@ class SocialDataset(Dataset):
             for word_i, word in enumerate(words):
                 data_point = self.process_word(word, word_i, utterance_labeled, words, player_num, is_player_speaker, utterance_involved)
                 if data_point:
-                    keypoint_seq = self.get_keypoint_sequence(keypoint_data, time_sec, player_num, keypoint_seq_ref, speaker_label)
+                    keypoint_seq, keypoint_indices = self.get_keypoint_sequence(
+                        keypoint_data,
+                        time_sec,
+                        player_num,
+                        keypoint_seq_ref,
+                        speaker_label,
+                    )
                     convers_context = self.get_conversation_context(utterances, utterance_i, start_idx, end_idx, data_point[1])
                     masked_i = utterance_i - start_idx
-                    data_points.append((convers_context, masked_i, keypoint_seq, player_num, speaker_label, data_point[0]))
-                    utterance_involved = data_point[2] # To avoid same utterances are involved under STI task
+                    self.alignment_records.append({
+                        'file_name': file_name,
+                        'utterance_index': utterance_i,
+                        'time_sec': time_sec,
+                        'keypoint_indices': keypoint_indices,
+                        'frame_indices': keypoint_indices,
+                    })
+                    data_points.append(
+                        (convers_context, masked_i, keypoint_seq, file_name, time_sec, player_num, speaker_label, data_point[0])
+                    )
+                    utterance_involved = data_point[2]
 
         return data_points
 
@@ -150,38 +211,41 @@ class SocialDataset(Dataset):
         return None
 
     def get_keypoint_sequence(self, keypoint_data, time_sec, player_num, keypoint_seq_ref, speaker_label):
-        keypoint_seq = np.zeros((6, 16, 17 * 2))
-        for time_i in range(16):
-            time_step = min(max(0, 5 * (time_sec - 1) + time_i), len(keypoint_data) - 1)
+        keypoint_seq = np.zeros((6, self.sequence_length, 17 * 2))
+        keypoint_indices = build_temporal_indices(
+            time_sec=time_sec,
+            sequence_length=self.sequence_length,
+            fps=self.video_fps,
+            total_steps=len(keypoint_data),
+        )
+
+        for time_i, time_step in enumerate(keypoint_indices):
             keypoints = keypoint_data[time_step]
             for keypoint in keypoints:
                 if keypoint['idx'] < player_num:
                     keypoint_wo_conf = np.delete(keypoint['keypoints'], np.arange(2, len(keypoint['keypoints']), 3))
                     keypoint_seq[keypoint['idx'], time_i, :] = keypoint_wo_conf[:17 * 2]
 
-            # Position correction for missing players
             for player_i in range(player_num):
                 if np.sum(keypoint_seq[player_i, time_i, :]) == 0:
                     keypoint_seq[player_i, time_i, :] = keypoint_seq_ref[player_i]
 
-        # Normalize keypoints based on the speaker
         zero_indices = np.where(keypoint_seq == 0)
         keypoint_seq = keypoint_seq - np.tile(keypoint_seq[speaker_label:speaker_label + 1][:, :, 0:2], (1, 1, 17))
         keypoint_seq[zero_indices] = 0
 
-        return keypoint_seq
+        return keypoint_seq, keypoint_indices
 
     def get_conversation_context(self, utterances, utterance_i, start_idx, end_idx, words_cp):
         target_utterance = ' '.join(words_cp)
         utterances_cp = copy.deepcopy(utterances)
         utterances_cp[utterance_i] = target_utterance
         convers_context = utterances_cp[start_idx:end_idx]
-        convers_context = [re.sub(r' \(\d{2}:\d{2}\)', '', utterance) for utterance in convers_context]  # Remove timestamps
+        convers_context = [re.sub(r' \(\d{2}:\d{2}\)', '', utterance) for utterance in convers_context]
 
         return convers_context
 
     def apply_augmentation(self, convers_context, keypoint_seq, player_num, speaker_label, task_label):
-        # Flip keypoint
         if np.random.random() < 0.5:
             keypoint_seq[:, :, ::2] = -1.0 * keypoint_seq[:, :, ::2]
             keypoint_seq_cp = copy.deepcopy(keypoint_seq)
@@ -189,7 +253,6 @@ class SocialDataset(Dataset):
                 keypoint_seq[:, :, 2 * change_i:2 * change_i + 1] = keypoint_seq_cp[:, :, 2 * change_i + 1:2 * change_i + 2]
                 keypoint_seq[:, :, 2 * change_i + 1:2 * change_i + 2] = keypoint_seq_cp[:, :, 2 * change_i:2 * change_i + 1]
 
-        # Shuffle player numbers
         player_numbers = list(range(player_num))
         shuffled_player_numbers = copy.deepcopy(player_numbers)
         np.random.shuffle(shuffled_player_numbers)
@@ -207,7 +270,7 @@ class SocialDataset(Dataset):
         return convers_context, keypoint_seq, speaker_label, task_label
 
     def tokenize_conversation(self, convers_context, masked_i):
-        tokens = self.tokenizer.encode(convers_context[masked_i], add_special_tokens=False) + [self.tokenizer.sep_token_id]
+        tokens = self.tokenizer.encode(convers_context[masked_i], add_special_tokens=False) + [self.sep_token_id]
 
         i = 0
         while True:
@@ -215,27 +278,55 @@ class SocialDataset(Dataset):
             after_exists = masked_i + i + 1 < len(convers_context)
             before_tokens = self.tokenizer.encode(convers_context[masked_i - i - 1], add_special_tokens=False) if before_exists else []
             after_tokens = self.tokenizer.encode(convers_context[masked_i + i + 1], add_special_tokens=False) if after_exists else []
-            if before_exists and len(tokens) + len(before_tokens) + 1 <= 511:  # add sentence before if available
-                tokens = before_tokens + [self.tokenizer.sep_token_id] + tokens
-            if after_exists and len(tokens) + len(after_tokens) + 1 <= 511:  # add sentence after if available
-                tokens = tokens + after_tokens + [self.tokenizer.sep_token_id]
+            if before_exists and len(tokens) + len(before_tokens) + 1 <= 511:
+                tokens = before_tokens + [self.sep_token_id] + tokens
+            if after_exists and len(tokens) + len(after_tokens) + 1 <= 511:
+                tokens = tokens + after_tokens + [self.sep_token_id]
             if not before_exists and not after_exists:
                 break
             i += 1
 
-        return [self.tokenizer.cls_token_id] + tokens
+        return [self.start_token_id] + tokens
+
+    def get_visual_frames(self, file_name, time_sec):
+        if not self.use_video_frames:
+            return None
+        if not self.video_dir or self.video_dir == 'enter_the_path':
+            raise ValueError(
+                f"visual_feature_type={self.visual_feature_type} requires a valid --video_dir or precomputed visual directory"
+            )
+
+        cached_clip_path = os.path.join(self.video_dir, f"{file_name}__{int(time_sec)}.npy")
+        if os.path.exists(cached_clip_path):
+            return np.load(cached_clip_path)
+
+        frames, frame_indices = load_frame_sequence(
+            self.video_dir,
+            file_name=file_name,
+            time_sec=time_sec,
+            sequence_length=self.sequence_length,
+            fps=self.video_fps,
+            frame_size=self.frame_size,
+        )
+        self.alignment_records.append({
+            'file_name': file_name,
+            'time_sec': time_sec,
+            'frame_indices': frame_indices,
+        })
+        return frames
 
     def __len__(self):
         return len(self.data_points)
 
     def __getitem__(self, idx):
-        convers_context, masked_i, keypoint_seq, player_num, speaker_label, task_label = self.data_points[idx]
+        convers_context, masked_i, keypoint_seq, file_name, time_sec, player_num, speaker_label, task_label = self.data_points[idx]
 
         if self.is_training:
             convers_context, keypoint_seq, speaker_label, task_label = \
                 self.apply_augmentation(convers_context, keypoint_seq, player_num, speaker_label, task_label)
 
         tokens = self.tokenize_conversation(convers_context, masked_i)
-        mask_idx = tokens.index(self.tokenizer.mask_token_id)
+        token_position = tokens.index(self.tokenizer.mask_token_id)
+        visual_frames = self.get_visual_frames(file_name, time_sec)
 
-        return tokens, mask_idx, keypoint_seq, speaker_label, task_label
+        return tokens, token_position, keypoint_seq, speaker_label, task_label, visual_frames
