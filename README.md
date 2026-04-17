@@ -27,6 +27,6 @@ Alignment check:
 
 Examples:
 
-![alignment example 1](assets/alignment/alignment_00_ONE#NIGHT#ULTIMATE#WEREWOLF##Retro#4_Game4.png)
-![alignment example 2](assets/alignment/alignment_01_ONE#NIGHT#ULTIMATE#WEREWOLF##Retro#4_Game7.png)
-![alignment example 3](assets/alignment/alignment_03_One#Night#Ultimate#Love#Letter##ONE#NIGHT#ULTIMATE#WEREWOLF_Game3.png)
+![alignment example 1](assets/alignment/alignment_example_1.png)
+![alignment example 2](assets/alignment/alignment_example_2.png)
+![alignment example 3](assets/alignment/alignment_example_3.png)
