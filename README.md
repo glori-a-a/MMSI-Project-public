@@ -18,3 +18,15 @@ Main files:
 - `run_gpt2_sti_wandb.sh`
 - `run_bart_sti_wandb.sh`
 - `run_gpt2_sti_cached_vit_quick_wandb.sh`
+
+Alignment check:
+
+- I line up keypoints and video frames on the same 5fps timeline.
+- For each utterance, both pose and RGB use the same 16-step window.
+- I checked the result by drawing keypoints on the sampled frames.
+
+Examples:
+
+![alignment example 1](assets/alignment/alignment_00_ONE#NIGHT#ULTIMATE#WEREWOLF##Retro#4_Game4.png)
+![alignment example 2](assets/alignment/alignment_01_ONE#NIGHT#ULTIMATE#WEREWOLF##Retro#4_Game7.png)
+![alignment example 3](assets/alignment/alignment_03_One#Night#Ultimate#Love#Letter##ONE#NIGHT#ULTIMATE#WEREWOLF_Game3.png)
