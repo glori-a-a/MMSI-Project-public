@@ -24,7 +24,7 @@ def parse_args():
     parser.add_argument('--output_dir', type=str, required=True)
     parser.add_argument('--marlin_model_name', type=str, default='marlin_vit_base_ytf')
     parser.add_argument('--marlin_checkpoint', type=str, required=True)
-    parser.add_argument('--language_model', type=str, default='bart', choices=['bert', 'roberta', 'electra', 'gpt2', 'bart'])
+    parser.add_argument('--language_model', type=str, default='roberta', choices=['bert', 'roberta', 'electra', 'gpt2', 'bart'])
     parser.add_argument('--context_length', type=int, default=5)
     parser.add_argument('--sequence_length', type=int, default=16)
     parser.add_argument('--video_fps', type=int, default=5)

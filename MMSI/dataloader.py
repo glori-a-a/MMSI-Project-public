@@ -296,9 +296,11 @@ class SocialDataset(Dataset):
                 f"visual_feature_type={self.visual_feature_type} requires a valid --video_dir or precomputed visual directory"
             )
 
-        cached_clip_path = os.path.join(self.video_dir, f"{file_name}__{int(time_sec)}.npy")
-        if os.path.exists(cached_clip_path):
-            return np.load(cached_clip_path)
+        flat_cached_clip_path = os.path.join(self.video_dir, f"{file_name}__{int(time_sec)}.npy")
+        nested_cached_clip_path = os.path.join(self.video_dir, file_name, f"{file_name}__{int(time_sec)}.npy")
+        for cached_clip_path in [flat_cached_clip_path, nested_cached_clip_path]:
+            if os.path.exists(cached_clip_path):
+                return np.load(cached_clip_path)
 
         frames, frame_indices = load_frame_sequence(
             self.video_dir,

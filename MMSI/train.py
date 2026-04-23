@@ -33,7 +33,7 @@ def parse_args():
     parser.add_argument('--data_split_file', type=str, default='enter_the_path', help='File path for data split')
     parser.add_argument('--checkpoint_save_dir', type=str, default='./checkpoints', help='Directory for saving checkpoints')
     parser.add_argument('--video_dir', type=str, default=None, help='Directory containing extracted frames, videos, or cached arrays')
-    parser.add_argument('--language_model', type=str, default='gpt2', choices=['bert', 'roberta', 'electra', 'gpt2', 'bart'], help='Language model to use')
+    parser.add_argument('--language_model', type=str, default='roberta', choices=['bert', 'roberta', 'electra', 'gpt2', 'bart'], help='Language model to use')
     parser.add_argument('--text_pooling', type=str, default='auto', choices=['auto', 'mask', 'last', 'mean'], help='Text pooling strategy')
     parser.add_argument('--visual_feature_type', type=str, default='keypoint',
                         choices=['keypoint', 'vit', 'keypoint_vit', 'marlin', 'keypoint_marlin'],

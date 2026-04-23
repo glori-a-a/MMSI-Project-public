@@ -176,6 +176,16 @@ class MultimodalBaseline(nn.Module):
         if visual_frames is None:
             raise ValueError(f"visual_feature_type={self.visual_feature_type} requires visual inputs")
 
+        if visual_frames.dim() == 2:
+            frame_features = self.visual_fc(visual_frames).unsqueeze(1)
+            if self.uses_keypoints:
+                # Utterance-level cached features are single clip descriptors.
+                # Repeat them across the expected visual token slots so the
+                # downstream fusion stack can consume them without changing the
+                # classifier or keypoint path.
+                frame_features = frame_features.repeat(1, 9, 1)
+            return frame_features.permute(1, 0, 2)
+
         if visual_frames.dim() == 3:
             frame_features = self.visual_fc(visual_frames)
             if self.uses_keypoints:
